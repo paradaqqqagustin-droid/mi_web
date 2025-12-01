@@ -524,7 +524,7 @@
         console.log("Bienvenido a la web de Agustin! 🎮⚽");
     </script>
     <script>
-        // 3v3 Football Game Engine - Advanced AI Edition
+        // 3v3 Football Game Engine - Possession & Stun Edition
         const canvas = document.getElementById('gameCanvas');
         const ctx = canvas.getContext('2d');
         const startBtn = document.getElementById('startGameBtn');
@@ -540,7 +540,7 @@
         document.querySelector('.controls-info').insertBefore(powerBarContainer, startBtn);
 
         // Update controls info text
-        document.querySelector('.controls-info p').innerHTML = '<strong>WASD</strong>: Moverse | <strong>Click Izquierdo</strong>: Disparo (Mantener para potencia) | <strong>Q</strong>: Barrida';
+        document.querySelector('.controls-info p').innerHTML = '<strong>WASD</strong>: Moverse | <strong>Click</strong>: Disparo | <strong>Q</strong>: Barrida | <strong>E</strong>: Dribbling (Counter)';
 
         // Game Constants
         const FIELD_WIDTH = 800;
@@ -548,19 +548,24 @@
         const PLAYER_RADIUS = 10;
         const BALL_RADIUS = 6;
         const GOAL_HEIGHT = 100;
-        const FRICTION = 0.97; // Slightly more friction for better control
+        const FRICTION = 0.97;
         const PLAYER_SPEED = 3.5;
         const SPRINT_SPEED = 6;
         const SHOOT_POWER_MAX = 18;
         const PASS_POWER = 12;
+        const STUN_DURATION = 90; // 1.5 seconds at 60fps
+        const CELEBRATION_DURATION = 300; // 5 seconds at 60fps
 
         let gameRunning = false;
         let score = { blue: 0, red: 0 };
+        let isGoalScored = false;
+        let celebrationTimer = 0;
+        let confettiParticles = [];
 
         // Input State
         const keys = {
             w: false, a: false, s: false, d: false,
-            q: false
+            q: false, e: false
         };
 
         let shootCharge = 0;
@@ -607,39 +612,69 @@
             }
         }
 
+        class Particle {
+            constructor(x, y) {
+                this.x = x;
+                this.y = y;
+                this.vx = (Math.random() - 0.5) * 10;
+                this.vy = (Math.random() - 0.5) * 10;
+                this.life = 100 + Math.random() * 100;
+                this.color = `hsl(${Math.random() * 360}, 100%, 50%)`;
+                this.size = Math.random() * 5 + 2;
+            }
+
+            update() {
+                this.x += this.vx;
+                this.y += this.vy;
+                this.vy += 0.1; // Gravity
+                this.vx *= 0.95;
+                this.vy *= 0.95;
+                this.life--;
+            }
+
+            draw() {
+                ctx.fillStyle = this.color;
+                ctx.fillRect(this.x, this.y, this.size, this.size);
+            }
+        }
+
         class Player extends Entity {
             constructor(x, y, team, isHuman = false) {
                 super(x, y, PLAYER_RADIUS, '#fff');
-                this.team = team; // 'blue' or 'red'
+                this.team = team;
                 this.isHuman = isHuman;
                 this.outline = team === 'blue' ? '#06b6d4' : '#ff0000';
                 this.sliding = false;
                 this.slideTimer = 0;
                 this.mass = 5;
 
+                // New Mechanics
+                this.stunTimer = 0;
+                this.isDribbling = false;
+
                 // AI State
-                this.role = 'IDLE'; // ATTACKER, DEFENDER, SUPPORT
+                this.role = 'IDLE';
                 this.targetX = x;
                 this.targetY = y;
-
-                // Stuck Detection
                 this.lastPos = { x: x, y: y };
                 this.stuckCounter = 0;
                 this.unstickTimer = 0;
                 this.unstickDir = { x: 0, y: 0 };
 
-                // Learning Stats (Simple Reinforcement)
-                this.stats = {
-                    passSuccess: 0,
-                    passFail: 0,
-                    dribbleSuccess: 0,
-                    dribbleFail: 0,
-                    shotsTaken: 0,
-                    goalsScored: 0
-                };
+                // Stats
+                this.stats = { passSuccess: 0, passFail: 0, dribbleSuccess: 0, dribbleFail: 0, shotsTaken: 0, goalsScored: 0 };
             }
 
             update(ball, allPlayers) {
+                // Handle Stun
+                if (this.stunTimer > 0) {
+                    this.stunTimer--;
+                    this.vx *= 0.8;
+                    this.vy *= 0.8;
+                    super.update();
+                    return; // Cannot act while stunned
+                }
+
                 if (this.isHuman) {
                     this.handleInput();
                 } else {
@@ -661,8 +696,12 @@
 
                 let speed = PLAYER_SPEED;
 
+                // Dribble Mode (E)
+                this.isDribbling = keys.e;
+                if (this.isDribbling) speed *= 0.8; // Slower while dribbling
+
                 // Slide Tackle
-                if (keys.q && !this.sliding) {
+                if (keys.q && !this.sliding && !this.isDribbling) {
                     this.sliding = true;
                     this.slideTimer = 20;
                     speed = SPRINT_SPEED * 2;
@@ -671,7 +710,6 @@
                         this.vx = (this.vx / mag) * speed;
                         this.vy = (this.vy / mag) * speed;
                     } else {
-                        // Slide forward if standing still (default right for blue)
                         this.vx = speed;
                     }
                     return;
@@ -694,7 +732,7 @@
             aiBehavior(ball, allPlayers) {
                 if (this.sliding) return;
 
-                // 1. Unstick Logic
+                // Unstick
                 if (this.unstickTimer > 0) {
                     this.vx += this.unstickDir.x * 0.5;
                     this.vy += this.unstickDir.y * 0.5;
@@ -703,144 +741,80 @@
                 }
                 this.checkStuck();
 
-                // 2. Determine Role & Strategy
                 const myTeam = allPlayers.filter(p => p.team === this.team);
                 const oppTeam = allPlayers.filter(p => p.team !== this.team);
-
-                // Distance to ball
                 const distToBall = Math.hypot(ball.x - this.x, ball.y - this.y);
+                const goalX = this.team === 'blue' ? FIELD_WIDTH : 0;
 
-                // Is my team in possession? (Ball closer to a teammate than any opponent)
-                // Simplified: If ball is moving towards opponent goal or controlled by teammate
-                // Let's use distance: closest player to ball is "Ball Holder" candidate
+                // AI Dribble Logic
+                if (ball.holder === this) {
+                    let nearestOpp = null;
+                    let minDist = Infinity;
+                    oppTeam.forEach(p => {
+                        const d = Math.hypot(this.x - p.x, this.y - p.y);
+                        if (d < minDist) { minDist = d; nearestOpp = p; }
+                    });
 
-                let closestTeammate = null;
-                let minDist = Infinity;
-                myTeam.forEach(p => {
-                    const d = Math.hypot(ball.x - p.x, ball.y - p.y);
-                    if (d < minDist) { minDist = d; closestTeammate = p; }
-                });
-
-                const isMeClosest = closestTeammate === this;
-                const goalX = this.team === 'blue' ? FIELD_WIDTH : 0; // Target Goal
-                const ownGoalX = this.team === 'blue' ? 0 : FIELD_WIDTH;
-
-                // --- BEHAVIOR TREE ---
-
-                if (isMeClosest) {
-                    // *** BALL HOLDER / PRESSER ***
-                    if (distToBall < BALL_RADIUS + PLAYER_RADIUS + 5) {
-                        // I have the ball (or very close)
-                        this.handleBallHolder(ball, goalX, myTeam, oppTeam);
+                    if (minDist < 40 && Math.random() < 0.1) {
+                        this.isDribbling = true;
                     } else {
-                        // Chase the ball (Pressing)
-                        this.moveTo(ball.x, ball.y, SPRINT_SPEED);
+                        this.isDribbling = false;
+                    }
+                } else {
+                    this.isDribbling = false;
+                }
 
-                        // Slide tackle if close and opponent has ball
-                        if (distToBall < 60 && Math.random() < 0.02) {
-                            // Check alignment
-                            // Simple check: just slide towards ball
+                // Determine Role
+                if (ball.holder === this) {
+                    this.handleBallHolder(ball, goalX, myTeam, oppTeam);
+                } else if (ball.holder && ball.holder.team === this.team) {
+                    // Support
+                    this.role = 'SUPPORT';
+                    const index = myTeam.indexOf(this);
+                    const yOffset = (index % 2 === 0) ? -100 : 100;
+                    this.moveTo(ball.x + (this.team === 'blue' ? -50 : 50), ball.y + yOffset, PLAYER_SPEED);
+                } else {
+                    // Defense / Chase
+                    if (distToBall < 100 || ball.holder === null) {
+                        this.moveTo(ball.x, ball.y, SPRINT_SPEED);
+                        if (ball.holder && ball.holder.team !== this.team && distToBall < 60 && Math.random() < 0.03) {
                             this.sliding = true;
                             this.slideTimer = 15;
                             const angle = Math.atan2(ball.y - this.y, ball.x - this.x);
                             this.vx = Math.cos(angle) * SPRINT_SPEED * 1.5;
                             this.vy = Math.sin(angle) * SPRINT_SPEED * 1.5;
                         }
-                    }
-                } else {
-                    // *** OFF BALL (SUPPORT / DEFEND) ***
-
-                    // Are we attacking or defending?
-                    // If ball is closer to opponent goal than own goal, we are attacking roughly
-                    // Or if a teammate has the ball.
-
-                    // Simple Formation Logic
-                    if (this.team === 'blue') {
-                        // Attacking Right
-                        if (ball.x > this.x) {
-                            // Support Attack
-                            this.role = 'SUPPORT';
-                            // Position: Triangle formation relative to ball
-                            // If I am the "upper" player, go up-right of ball. "Lower" go down-right.
-                            // Simple index check
-                            const index = myTeam.indexOf(this);
-                            const yOffset = (index % 2 === 0) ? -100 : 100;
-                            this.moveTo(ball.x - 50, ball.y + yOffset, PLAYER_SPEED);
-                        } else {
-                            // Defend
-                            this.role = 'DEFEND';
-                            // Stay between ball and own goal
-                            const targetX = (ball.x + ownGoalX) / 2;
-                            const targetY = ball.y * 0.8 + (FIELD_HEIGHT / 2) * 0.2; // Bias to center
-                            this.moveTo(targetX, targetY, PLAYER_SPEED);
-                        }
                     } else {
-                        // Red Team (AI)
-                        // Attacking Left
-                        if (ball.x < this.x) {
-                            // Support Attack
-                            this.role = 'SUPPORT';
-                            const index = myTeam.indexOf(this);
-                            const yOffset = (index % 2 === 0) ? -100 : 100;
-                            this.moveTo(ball.x + 50, ball.y + yOffset, PLAYER_SPEED);
-                        } else {
-                            // Defend
-                            this.role = 'DEFEND';
-                            const targetX = (ball.x + ownGoalX) / 2;
-                            const targetY = ball.y;
-                            this.moveTo(targetX, targetY, PLAYER_SPEED);
-                        }
+                        // Mark
+                        this.role = 'DEFEND';
+                        const targetX = (ball.x + (this.team === 'blue' ? 0 : FIELD_WIDTH)) / 2;
+                        this.moveTo(targetX, ball.y, PLAYER_SPEED);
                     }
                 }
             }
 
             handleBallHolder(ball, goalX, myTeam, oppTeam) {
-                // DECISION: Shoot, Pass, or Dribble?
-
                 const distToGoal = Math.abs(goalX - this.x);
 
-                // 1. SHOOT
-                if (distToGoal < 250) {
-                    // Check line of sight (simplified)
-                    // Just shoot if close enough and random chance
-                    if (Math.random() < 0.1) {
-                        this.shoot(ball, goalX, FIELD_HEIGHT / 2);
-                        return;
-                    }
+                // Shoot
+                if (distToGoal < 250 && Math.random() < 0.1) {
+                    this.shoot(ball, goalX, FIELD_HEIGHT / 2);
+                    return;
                 }
 
-                // 2. PASS
-                // Find open teammate
-                // "Learning": If pass fail rate is high, reduce pass probability
+                // Pass
                 let passProb = 0.05;
                 if (this.stats.passFail > this.stats.passSuccess) passProb = 0.02;
-
                 if (Math.random() < passProb) {
-                    const teammate = myTeam.find(p => p !== this && Math.abs(p.x - goalX) < Math.abs(this.x - goalX)); // Pass forward
+                    const teammate = myTeam.find(p => p !== this && Math.abs(p.x - goalX) < Math.abs(this.x - goalX));
                     if (teammate) {
-                        this.shoot(ball, teammate.x, teammate.y, PASS_POWER); // Pass is just a weaker shot at teammate
+                        this.shoot(ball, teammate.x, teammate.y, PASS_POWER);
                         return;
                     }
                 }
 
-                // 3. DRIBBLE
-                // Move towards goal, slightly away from nearest opponent
-                let targetY = FIELD_HEIGHT / 2;
-                // Avoid nearest opponent
-                let nearestOpp = null;
-                let minDist = Infinity;
-                oppTeam.forEach(p => {
-                    const d = Math.hypot(this.x - p.x, this.y - p.y);
-                    if (d < minDist) { minDist = d; nearestOpp = p; }
-                });
-
-                if (nearestOpp && minDist < 100) {
-                    // Move away from opponent
-                    if (nearestOpp.y > this.y) targetY = 50; // Go up
-                    else targetY = FIELD_HEIGHT - 50; // Go down
-                }
-
-                this.moveTo(goalX, targetY, PLAYER_SPEED);
+                // Dribble Move
+                this.moveTo(goalX, FIELD_HEIGHT / 2, PLAYER_SPEED);
             }
 
             moveTo(tx, ty, speed) {
@@ -858,13 +832,11 @@
             }
 
             shoot(ball, tx, ty, power = SHOOT_POWER_MAX) {
+                ball.holder = null; // Release ball
                 const angle = Math.atan2(ty - ball.y, tx - ball.x);
-                // Add some inaccuracy
                 const spread = (Math.random() - 0.5) * 0.2;
                 ball.vx += Math.cos(angle + spread) * power;
                 ball.vy += Math.sin(angle + spread) * power;
-
-                // Record stat (simplified)
                 this.stats.shotsTaken++;
             }
 
@@ -886,7 +858,7 @@
             draw() {
                 ctx.beginPath();
                 ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
-                ctx.fillStyle = '#fff';
+                ctx.fillStyle = this.stunTimer > 0 ? '#555' : '#fff'; // Gray if stunned
                 ctx.fill();
                 ctx.strokeStyle = this.outline;
                 ctx.lineWidth = 3;
@@ -899,10 +871,18 @@
                     ctx.stroke();
                 }
 
-                // Debug: Draw Role
-                // ctx.fillStyle = 'white';
-                // ctx.font = '10px Arial';
-                // ctx.fillText(this.role.substring(0,1), this.x-3, this.y+3);
+                if (this.isDribbling) {
+                    ctx.beginPath();
+                    ctx.arc(this.x, this.y, this.radius + 8, 0, Math.PI * 2);
+                    ctx.strokeStyle = 'rgba(255, 215, 0, 0.8)'; // Gold aura
+                    ctx.lineWidth = 2;
+                    ctx.stroke();
+                }
+
+                if (this.stunTimer > 0) {
+                    ctx.fillStyle = 'yellow';
+                    ctx.fillText('💫', this.x - 5, this.y - 15);
+                }
             }
         }
 
@@ -910,23 +890,34 @@
             constructor() {
                 super(FIELD_WIDTH / 2, FIELD_HEIGHT / 2, BALL_RADIUS, '#fff');
                 this.mass = 1;
-                this.lastTouchedBy = null; // For stats
+                this.holder = null;
+                this.lastTouchedBy = null;
             }
 
             update() {
-                super.update();
+                if (this.holder) {
+                    this.x = this.holder.x + this.holder.vx * 2;
+                    this.y = this.holder.y + this.holder.vy * 2;
+                    this.vx = this.holder.vx;
+                    this.vy = this.holder.vy;
+
+                    if (this.holder.stunTimer > 0) {
+                        this.holder = null;
+                    }
+                } else {
+                    super.update();
+                }
+
                 // Goal check
                 if (this.x <= this.radius && this.y > FIELD_HEIGHT / 2 - GOAL_HEIGHT / 2 && this.y < FIELD_HEIGHT / 2 + GOAL_HEIGHT / 2) {
                     score.red++;
                     aiScoreEl.textContent = score.red;
-                    if (this.lastTouchedBy && this.lastTouchedBy.team === 'red') this.lastTouchedBy.stats.goalsScored++;
-                    this.reset();
+                    startCelebration();
                 }
                 if (this.x >= FIELD_WIDTH - this.radius && this.y > FIELD_HEIGHT / 2 - GOAL_HEIGHT / 2 && this.y < FIELD_HEIGHT / 2 + GOAL_HEIGHT / 2) {
                     score.blue++;
                     playerScoreEl.textContent = score.blue;
-                    if (this.lastTouchedBy && this.lastTouchedBy.team === 'blue') this.lastTouchedBy.stats.goalsScored++;
-                    this.reset();
+                    startCelebration();
                 }
             }
 
@@ -935,6 +926,7 @@
                 this.y = FIELD_HEIGHT / 2;
                 this.vx = 0;
                 this.vy = 0;
+                this.holder = null;
                 this.lastTouchedBy = null;
                 initTeams();
             }
@@ -945,85 +937,98 @@
 
         function initTeams() {
             players = [];
-            // Blue Team (Human + 2 AI)
-            players.push(new Player(150, FIELD_HEIGHT / 2, 'blue', true)); // Human
+            players.push(new Player(150, FIELD_HEIGHT / 2, 'blue', true));
             players.push(new Player(100, FIELD_HEIGHT / 3, 'blue'));
             players.push(new Player(100, FIELD_HEIGHT * 2 / 3, 'blue'));
 
-            // Red Team (3 AI)
             players.push(new Player(FIELD_WIDTH - 150, FIELD_HEIGHT / 2, 'red'));
             players.push(new Player(FIELD_WIDTH - 100, FIELD_HEIGHT / 3, 'red'));
             players.push(new Player(FIELD_WIDTH - 100, FIELD_HEIGHT * 2 / 3, 'red'));
         }
 
+        function startCelebration() {
+            isGoalScored = true;
+            celebrationTimer = CELEBRATION_DURATION;
+            // Spawn confetti
+            for (let i = 0; i < 100; i++) {
+                confettiParticles.push(new Particle(FIELD_WIDTH / 2, FIELD_HEIGHT / 2));
+            }
+        }
+
         function checkCollisions() {
-            // Player-Ball Collision
             players.forEach(p => {
+                if (p.stunTimer > 0) return;
+
                 const dx = ball.x - p.x;
                 const dy = ball.y - p.y;
                 const dist = Math.hypot(dx, dy);
 
-                if (dist < p.radius + ball.radius) {
-                    // Collision resolution
-                    const angle = Math.atan2(dy, dx);
-                    const force = p.sliding ? 12 : 1.5; // Stronger kick if sliding
-
-                    // Push ball out
-                    const overlap = (p.radius + ball.radius - dist);
-                    ball.x += Math.cos(angle) * overlap;
-                    ball.y += Math.sin(angle) * overlap;
-
-                    // Transfer momentum
-                    ball.vx += Math.cos(angle) * force + p.vx * 0.5;
-                    ball.vy += Math.sin(angle) * force + p.vy * 0.5;
-
-                    ball.lastTouchedBy = p;
+                if (dist < p.radius + ball.radius + 5) {
+                    if (!ball.holder) {
+                        ball.holder = p;
+                        ball.lastTouchedBy = p;
+                    }
                 }
             });
 
-            // Player-Player Collision
             for (let i = 0; i < players.length; i++) {
                 for (let j = i + 1; j < players.length; j++) {
                     const p1 = players[i];
                     const p2 = players[j];
+
+                    if (p1.stunTimer > 0 || p2.stunTimer > 0) continue;
+
                     const dx = p2.x - p1.x;
                     const dy = p2.y - p1.y;
                     const dist = Math.hypot(dx, dy);
 
-                    if (dist < p1.radius + p2.radius) {
-                        const angle = Math.atan2(dy, dx);
-                        const overlap = (p1.radius + p2.radius - dist) / 2;
-
-                        p1.x -= Math.cos(angle) * overlap;
-                        p1.y -= Math.sin(angle) * overlap;
-                        p2.x += Math.cos(angle) * overlap;
-                        p2.y += Math.sin(angle) * overlap;
+                    if (dist < p1.radius + p2.radius + 5) {
+                        if (p1.sliding && ball.holder === p2) {
+                            resolveTackle(p1, p2);
+                        }
+                        else if (p2.sliding && ball.holder === p1) {
+                            resolveTackle(p2, p1);
+                        }
+                        else {
+                            const angle = Math.atan2(dy, dx);
+                            const overlap = (p1.radius + p2.radius - dist) / 2;
+                            p1.x -= Math.cos(angle) * overlap;
+                            p1.y -= Math.sin(angle) * overlap;
+                            p2.x += Math.cos(angle) * overlap;
+                            p2.y += Math.sin(angle) * overlap;
+                        }
                     }
                 }
             }
         }
 
+        function resolveTackle(tackler, victim) {
+            if (victim.isDribbling) {
+                tackler.stunTimer = STUN_DURATION;
+                tackler.sliding = false;
+            } else {
+                victim.stunTimer = STUN_DURATION;
+                ball.holder = tackler;
+                ball.lastTouchedBy = tackler;
+            }
+        }
+
         function drawField() {
-            // Grass
             ctx.fillStyle = '#1a472a';
             ctx.fillRect(0, 0, FIELD_WIDTH, FIELD_HEIGHT);
 
-            // Lines
             ctx.strokeStyle = 'rgba(255,255,255,0.3)';
             ctx.lineWidth = 2;
 
-            // Center line
             ctx.beginPath();
             ctx.moveTo(FIELD_WIDTH / 2, 0);
             ctx.lineTo(FIELD_WIDTH / 2, FIELD_HEIGHT);
             ctx.stroke();
 
-            // Center circle
             ctx.beginPath();
             ctx.arc(FIELD_WIDTH / 2, FIELD_HEIGHT / 2, 50, 0, Math.PI * 2);
             ctx.stroke();
 
-            // Goals
             ctx.fillStyle = 'rgba(255,255,255,0.1)';
             ctx.fillRect(0, FIELD_HEIGHT / 2 - GOAL_HEIGHT / 2, 20, GOAL_HEIGHT);
             ctx.fillRect(FIELD_WIDTH - 20, FIELD_HEIGHT / 2 - GOAL_HEIGHT / 2, 20, GOAL_HEIGHT);
@@ -1032,8 +1037,22 @@
         function updateGame() {
             if (!gameRunning) return;
 
-            // Shooting Logic (Mouse)
-            if (isCharging) {
+            if (isGoalScored) {
+                celebrationTimer--;
+                confettiParticles.forEach((p, index) => {
+                    p.update();
+                    if (p.life <= 0) confettiParticles.splice(index, 1);
+                });
+
+                if (celebrationTimer <= 0) {
+                    isGoalScored = false;
+                    confettiParticles = [];
+                    ball.reset();
+                }
+                return; // Pause game physics
+            }
+
+            if (isCharging && ball.holder && ball.holder.isHuman) {
                 if (shootCharge < 100) shootCharge += 2;
                 powerBarFill.style.width = shootCharge + '%';
             }
@@ -1048,13 +1067,27 @@
             players.forEach(p => p.draw());
             ball.draw();
 
-            // Draw aiming line if charging
-            if (isCharging) {
+            if (isGoalScored) {
+                confettiParticles.forEach(p => p.draw());
+
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+                ctx.fillRect(0, FIELD_HEIGHT / 2 - 50, FIELD_WIDTH, 100);
+
+                ctx.fillStyle = '#FFD700';
+                ctx.font = 'bold 60px Outfit';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText('¡GOL!', FIELD_WIDTH / 2, FIELD_HEIGHT / 2);
+                ctx.strokeStyle = 'white';
+                ctx.lineWidth = 2;
+                ctx.strokeText('¡GOL!', FIELD_WIDTH / 2, FIELD_HEIGHT / 2);
+            }
+
+            if (isCharging && ball.holder && ball.holder.isHuman) {
                 const human = players[0];
                 ctx.beginPath();
                 ctx.moveTo(human.x, human.y);
 
-                // Calculate aim direction relative to canvas
                 const rect = canvas.getBoundingClientRect();
                 const aimX = mouseX - rect.left;
                 const aimY = mouseY - rect.top;
@@ -1075,11 +1108,11 @@
 
         // Input Listeners
         window.addEventListener('keydown', e => {
-            if (keys.hasOwnProperty(e.key)) keys[e.key] = true;
+            if (keys.hasOwnProperty(e.key.toLowerCase())) keys[e.key.toLowerCase()] = true;
         });
 
         window.addEventListener('keyup', e => {
-            if (keys.hasOwnProperty(e.key)) keys[e.key] = false;
+            if (keys.hasOwnProperty(e.key.toLowerCase())) keys[e.key.toLowerCase()] = false;
         });
 
         // Mouse Listeners for Shooting
@@ -1090,33 +1123,26 @@
 
         canvas.addEventListener('mousedown', e => {
             if (e.button === 0 && gameRunning) { // Left click
-                isCharging = true;
-                shootCharge = 0;
-                powerBarContainer.style.display = 'block';
+                // Only charge if human has ball
+                if (ball.holder && ball.holder.isHuman) {
+                    isCharging = true;
+                    shootCharge = 0;
+                    powerBarContainer.style.display = 'block';
+                }
             }
         });
 
         window.addEventListener('mouseup', e => {
             if (e.button === 0 && isCharging && gameRunning) {
-                // Release shot
-                const human = players[0];
-                const rect = canvas.getBoundingClientRect();
-                const aimX = e.clientX - rect.left;
-                const aimY = e.clientY - rect.top;
+                if (ball.holder && ball.holder.isHuman) {
+                    // Release shot
+                    const human = ball.holder;
+                    const rect = canvas.getBoundingClientRect();
+                    const aimX = e.clientX - rect.left;
+                    const aimY = e.clientY - rect.top;
 
-                const dx = aimX - human.x;
-                const dy = aimY - human.y;
-                const angle = Math.atan2(dy, dx);
-
-                // Only shoot if ball is close
-                const ballDx = ball.x - human.x;
-                const ballDy = ball.y - human.y;
-                const dist = Math.hypot(ballDx, ballDy);
-
-                if (dist < human.radius + ball.radius + 15) {
                     const power = (shootCharge / 100) * SHOOT_POWER_MAX;
-                    ball.vx += Math.cos(angle) * power;
-                    ball.vy += Math.sin(angle) * power;
+                    human.shoot(ball, aimX, aimY, power);
                 }
 
                 isCharging = false;
